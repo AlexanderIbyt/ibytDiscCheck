@@ -1,0 +1,1087 @@
+// diskcheck — checks storage devices (USB sticks, hard disks, SSDs) for errors.
+// Version 1.0
+//
+// Purpose:   Lists all drives the BIOS knows and tests one of them. Three tests:
+//              1 Quick test   reads every 32nd block of 32 KB plus the end of the disk (about 3 %): seconds to minutes
+//              2 Read test    reads every sector. The data stays unchanged, so the test is safe on any disk.
+//              3 Write test   writes a pattern that depends on the sector number into every sector, then reads it all back.
+//                             DESTROYS ALL DATA on the drive. Also finds fake USB sticks (too little real memory, the rest
+//                             wraps around and overwrites the beginning) and sectors that do not hold their data.
+// Method:    Reading and writing use the Disk library (BIOS, INT 13h) in blocks of 64 sectors. If a block fails, every
+//            sector is tried alone (twice), so the program finds the exact sectors. It counts read errors, write errors
+//            and data errors (what was read is not what was written) and remembers the first 32 sector numbers.
+//            It also counts slow blocks (longer than 0.5 s): a hint for sectors the drive reads only with effort,
+//            often before it fails. Speed comes from the CPU time stamp counter (rdtsc, calibrated against the PIT).
+// Limits:    Only drives with 512-byte sectors. The boot drive (the one IbytBMS runs from) is never written.
+//            The read test shows only what the BIOS reports: a drive can hide read errors (the write test then helps).
+//            The self-test functions of the drives (SMART) are not read.
+// Ending:    Esc stops a test. After a test the drive selection comes back; Enter without a number quits the program.
+
+ibyt_bare
+import <BasicBare.ibyt>
+import <Keyboard.ibyt>
+import <Disk.ibyt>
+
+
+// ───────────── Constants ─────────────
+public define CHUNK:       64             // sectors per block (32 KB)
+public define LIST_MAX:    32             // so many bad sectors are remembered
+public define QUICK_SKIP:  1984           // quick test: after one block skip 31 blocks (31 * 64 sectors)
+public define SLOW_MS:     500            // blocks that take longer than this count as slow
+public define PROG_EVERY:  32             // show progress every 32 blocks (1 MiB)
+
+
+// ───────────── State ─────────────
+// chkDisk: the disk that is tested and the kind of test
+//   total      sectors of the chosen drive
+//   drive      BIOS code of the chosen drive
+//   bootDrive  BIOS code of the drive IbytBMS runs from
+//   mode       1 quick, 2 read, 3 write
+private int64 chkDisk{ total, drive, bootDrive, mode }
+
+// chkPass: the pass that runs at the moment: position, block, sector retry
+//   phase      0 reading, 1 writing, 2 verifying (shown in the progress line)
+//   cur        first sector of the current block
+//   chunkSecs  sectors of the current block
+//   blocks     blocks done in this pass
+//   tested     sectors this pass handled without error
+//   tailDone   quick test: the end of the disk was already read
+//   passStart  TSC at the start of the pass
+//   sec        sector inside the block (single-sector retry and verify)
+//   lba        absolute number of the sector that is retried
+//   tries      attempts made for that sector
+//   running    1 while the pass loop has to go on
+private int64 chkPass{ phase, cur, chunkSecs, blocks, tested, tailDone, passStart, sec, lba, tries, running }
+
+// chkCount: what the test found
+//   lastErr    last BIOS error code
+//   listed     how many bad sectors are in the list
+//   aborted    1 when the test was stopped with Esc
+private int64 chkCount{ readErr, writeErr, dataErr, slow, lastErr, listed, aborted }
+
+// chkTime: time measurement
+//   mhz        CPU speed in MHz (TSC ticks per microsecond)
+//   t0         TSC at the start of a block
+//   slowLimit  TSC ticks above which a block counts as slow
+private int64 chkTime{ mhz, t0, slowLimit }
+
+// chkInput: keyboard input and the disk list
+//   numVal     the number typed so far
+//   numLen     how many digits were typed
+//   yesPos     how many letters of the YES word were typed
+//   diskI      BIOS code of the drive that is listed or looked at
+//   keyDone    1 when Enter ended the input
+//   menuRun    1 while the drive menu goes on
+private int64 chkInput{ numVal, numLen, yesPos, diskI, keyDone, menuRun }
+
+private int64 BadLba[32]                  // sector numbers of the first bad sectors
+private byte BadKind[32]                  // 0 read error, 1 write error, 2 data error
+private byte YesBuf[8]                    // letters typed for the YES question
+private byte Buf[32768]                   // one block of 64 sectors
+
+
+// ───────────── Machine code helpers ─────────────
+// Tsc: → $counter (r12) = time stamp counter of the CPU
+public asm methode Tsc{
+    rdtsc                                 ; edx:eax = TSC
+    shl  rdx, 32
+    or   rax, rdx                         ; rax = full 64-bit value
+    mov  r12, rax
+    ret
+}
+
+// TscMhz: measures the TSC against the PIT (channel 2, about 50 ms) → $counter (r12) = speed in MHz, 0 if not measurable
+public asm methode TscMhz{
+    ; switch the PIT channel 2 gate on, speaker off
+    in   al, 0x61
+    and  al, 0xFD
+    or   al, 0x01
+    out  0x61, al
+    ; channel 2, mode 5, count 0xE90B (about 50 ms)
+    mov  al, 0xB0
+    out  0x43, al
+    mov  al, 0x0B
+    out  0x42, al
+    mov  al, 0xE9
+    out  0x42, al
+    ; note the TSC at the start
+    rdtsc
+    shl  rdx, 32
+    or   rax, rdx
+    mov  r11, rax
+    ; wait until the PIT output goes high (with a safety limit)
+    mov  ecx, 100000000
+.Main_TscMhz_wait:
+    in   al, 0x61
+    test al, 0x20
+    jnz  .Main_TscMhz_done
+    dec  ecx
+    jnz  .Main_TscMhz_wait
+    xor  r12d, r12d                       ; timed out: no result
+    ret
+.Main_TscMhz_done:
+    ; ticks in 50 ms / 50000 = ticks per microsecond
+    rdtsc
+    shl  rdx, 32
+    or   rax, rdx
+    sub  rax, r11
+    xor  edx, edx
+    mov  ecx, 50000
+    div  rcx
+    mov  r12, rax
+    ret
+}
+
+// Fill: $base = first sector (LBA), $work = number of sectors (at most 64) → fills Buf with the pattern. Every qword depends on its
+// position on the drive (sector number * 64 + place in the sector), never 0. Changes: rax, rcx, rdx, rdi, r11 (r8 to r10 stay).
+public asm methode Fill{
+    push r8
+    push r9
+    push r10
+    lea  rdi, [Main_Buf]                  ; write position
+    mov  r8, 0x9E3779B97F4A7C15           ; mixing constant
+    mov  r9, rbx                          ; sectors left
+    mov  r10, r14
+    shl  r10, 6                           ; qword counter = sector * 64
+    test r9, r9
+    jz   .Main_Fill_done
+.Main_Fill_sector:
+    mov  ecx, 64                          ; 64 qwords per sector
+.Main_Fill_qword:
+    lea  rax, [r10 + 0x1234567]
+    imul rax, r8
+    mov  rdx, rax
+    shr  rdx, 29
+    xor  rax, rdx                         ; rax = pattern value for this position
+    stosq
+    inc  r10
+    dec  ecx
+    jnz  .Main_Fill_qword
+    dec  r9
+    jnz  .Main_Fill_sector
+.Main_Fill_done:
+    pop  r10
+    pop  r9
+    pop  r8
+    ret
+}
+
+// VerifySector: $base = sector number (LBA), $work = number of the sector in Buf (0..63) → Carry = 1: the sector holds the pattern of Fill.
+// Changes: rax, rcx, rdx, rsi, rdi (r8, r10 stay).
+public asm methode VerifySector{
+    push r8
+    push r10
+    mov  r10, r14
+    shl  r10, 6                           ; qword counter = sector * 64
+    mov  rsi, rbx
+    shl  rsi, 9                           ; byte offset of the sector in Buf
+    lea  rdi, [Main_Buf]
+    add  rsi, rdi                         ; rsi = address of the sector
+    mov  r8, 0x9E3779B97F4A7C15
+    mov  ecx, 64
+.Main_VerifySector_qword:
+    lea  rax, [r10 + 0x1234567]           ; same formula as in Fill
+    imul rax, r8
+    mov  rdx, rax
+    shr  rdx, 29
+    xor  rax, rdx
+    cmp  rax, [rsi]
+    jne  .Main_VerifySector_bad           ; one wrong qword is enough
+    add  rsi, 8
+    inc  r10
+    dec  ecx
+    jnz  .Main_VerifySector_qword
+    pop  r10
+    pop  r8
+    stc                                   ; pattern is intact
+    ret
+.Main_VerifySector_bad:
+    pop  r10
+    pop  r8
+    clc                                   ; pattern is wrong
+    ret
+}
+
+
+// ───────────── Keyboard input ─────────────
+// Reads a number into chkInput.numVal (digits, Backspace and Enter only). chkInput.numLen = number of typed digits.
+private methode ReadNumber(base, work, item, admin){
+    // start with an empty number
+    chkInput.numVal: 0
+    chkInput.numLen: 0
+    chkInput.keyDone: 0
+
+    // read keys until Enter is pressed
+    $work@Done: 0
+    loop ($work = 0){
+        call BasicBare.ShowCursor(=)
+        call Keyboard.GetKey(=)
+
+        if ($base@Key = KB_ENTER){
+            // Enter ends the input
+            chkInput.keyDone: 1
+        } else {
+            if ($base = KB_BACKSPACE){
+                // Backspace: drop the last digit, if there is one
+                $work@Len: chkInput.numLen
+                if ($work > 0){
+                    $work--
+                    chkInput.numLen: $work
+                    $work@Value: chkInput.numVal
+                    $work /: 10
+                    chkInput.numVal: $work
+                    prepare $base@Char: KB_BACKSPACE call BasicBare.PutChar(=)
+                }
+            } else {
+                // a digit: accept it while there are fewer than 6
+                if ($base >= '0' and $base <= '9'){
+                    $work@Len: chkInput.numLen
+                    if ($work < 6){
+                        // value = value * 10 + digit
+                        $work@Value: chkInput.numVal
+                        $work *: 10
+                        $work +: $base
+                        $work -: 48
+                        chkInput.numVal: $work
+                        chkInput.numLen++
+                        prepare $base@Char call BasicBare.PutChar(=)
+                    }
+                }
+            }
+        }
+
+        // look whether Enter was pressed
+        $work: chkInput.keyDone
+    }
+
+    // move the cursor to the next line
+    prepare $base@Char: 10 call BasicBare.PutChar(=)
+}
+
+// Reads a word until Enter. Carry = 1 only for exactly YES (capital letters).
+private methode ReadYes(base, keep work, item, admin){
+    chkInput.yesPos: 0
+    chkInput.keyDone: 0
+
+    // read keys until Enter is pressed
+    $work@Done: 0
+    loop ($work = 0){
+        call BasicBare.ShowCursor(=)
+        call Keyboard.GetKey(=)
+
+        if ($base@Key = KB_ENTER){
+            // Enter ends the input
+            chkInput.keyDone: 1
+        } else {
+            if ($base = KB_BACKSPACE){
+                // Backspace: drop the last letter, if there is one
+                $work@Pos: chkInput.yesPos
+                if ($work > 0){
+                    $work--
+                    chkInput.yesPos: $work
+                    prepare $base@Char: KB_BACKSPACE call BasicBare.PutChar(=)
+                }
+            } else {
+                // a plain character: keep up to 7 letters
+                if ($base <= 255){
+                    $work@Pos: chkInput.yesPos
+                    if ($work < 7){
+                        YesBuf[$work]: $base
+                        $work++
+                        chkInput.yesPos: $work
+                        prepare $base@Char call BasicBare.PutChar(=)
+                    }
+                }
+            }
+        }
+
+        // look whether Enter was pressed
+        $work: chkInput.keyDone
+    }
+
+    // move the cursor to the next line
+    prepare $base@Char: 10 call BasicBare.PutChar(=)
+
+    // exactly three letters Y E S?
+    $work@Len: chkInput.yesPos
+    if ($work = 3){
+        _@Letter: YesBuf[0]
+        if (_ = 'Y'){
+            _: YesBuf[1]
+            if (_ = 'E'){
+                _: YesBuf[2]
+                if (_ = 'S'){
+                    set_carry
+                    return
+                }
+            }
+        }
+    }
+
+    unset_carry
+}
+
+// Esc pressed? Carry = 1 yes.
+private methode EscPressed(base, item, admin){
+    // look at the keyboard without waiting
+    call Keyboard.TryKey(=)
+    goto_flag not_carry NoKey
+
+    if ($base@Key = KB_ESC){
+        set_carry
+    } else {
+        unset_carry
+    }
+    return
+
+    ->NoKey
+        unset_carry
+}
+
+
+// ───────────── Output helpers ─────────────
+// Shows "disk N (0xCC)" for $base = BIOS code.
+prepare $base@DriveCode
+private methode PutDisk(base, work, xmm6, item){
+    $xmm6: $base                          // keep the BIOS code over the calls
+
+    prepare $pBase: "disk "
+    call BasicBare.Print(=)
+
+    // disk number = BIOS code - 128
+    $base: $xmm6
+    $base -: 128
+    prepare $base@Number
+    call BasicBare.PrintInt(=)
+
+    prepare $pBase: " ("
+    call BasicBare.Print(=)
+
+    // the BIOS code as two hex digits
+    prepare $base: $xmm6, $work@Digits: 2 call BasicBare.PrintHexFix(=)
+
+    prepare $pBase: ")"
+    call BasicBare.Print(=)
+}
+
+// Writes $base as a number, right-aligned in $work columns. Changes: $base, $work and the scratch registers.
+prepare $base@Number, $work@Width
+private methode PutPad(keep base, work, keep index, xmm6, xmm7, xmm8, item, admin){
+    $xmm6: $base                          // keep the number
+    $xmm7: $work                          // keep the width
+
+    // count the digits: divide by 10 until one digit is left
+    $index@Digits: 1
+    $work@Rest: $base
+    loop ($work >= 10){
+        $work /: 10
+        $index++
+    }
+
+    // fill with spaces while the width is larger than the digits
+    $work@Width: $xmm7
+    loop ($work > $index){
+        $xmm7: $work
+        $xmm8: $index
+        prepare $base@Char: 32 call BasicBare.PutChar(=)
+        $work: $xmm7
+        $index: $xmm8
+        $work--
+    }
+
+    // now the number itself
+    prepare $base@Number: $xmm6 call BasicBare.PrintInt(=)
+}
+
+// Lists the drives 0x80 to 0x8F.
+private methode ListDisks(base, work, keep index, counter, value, xmm6, xmm7, xmm8, xmm9, xmm10, item, admin){
+    prepare $pBase@Text: "Disk  Code       Size    Sectors  Note\n" call BasicBare.Print(=)
+
+    // BIOS hard disks are numbered 0x80 ... 0x8F
+    chkInput.diskI: 128
+    $work@Drive: 128
+    loop ($work < 144){
+        // does the BIOS know this drive? (Carry = 1 yes)
+        prepare $base@Drive: chkInput.diskI call Disk.Info(=)
+        goto_flag not_carry NextDisk
+
+        $xmm9: $counter@Sectors
+        $xmm10: $value@SectorSize
+
+        // number and BIOS code
+        prepare $pBase: "  " call BasicBare.Print(=)
+        $base: chkInput.diskI
+        $base -: 128
+        prepare $base, $work: 2 call PutPad(=)
+        prepare $pBase: "  " call BasicBare.Print(=)
+        prepare $base: chkInput.diskI, $work: 2 call BasicBare.PrintHexFix(=)
+        prepare $pBase: "  " call BasicBare.Print(=)
+
+        // size in bytes = sectors * sector size, shown as KiB or MiB
+        $base: $xmm9
+        $base *: $xmm10
+        if ($base@Bytes < 1048576){
+            $base >>: 10
+            prepare $base@Number, $work@Width: 6 call PutPad(=)
+            prepare $pBase: " KiB  " call BasicBare.Print(=)
+        } else {
+            $base >>: 20
+            prepare $base, $work: 6 call PutPad(=)
+            prepare $pBase: " MiB  " call BasicBare.Print(=)
+        }
+
+        // number of sectors
+        prepare $base@Number: $xmm9, $work@Width: 10 call PutPad(=)
+        prepare $pBase: "  " call BasicBare.Print(=)
+
+        // the boot drive gets a note: it is never written
+        $work: chkInput.diskI
+        if ($work = chkDisk.bootDrive){
+            prepare $pBase: "boot disk (no write test)" call BasicBare.Print(=)
+        }
+        prepare $base@Char: 10 call BasicBare.PutChar(=)
+
+        // next drive
+        ->NextDisk
+            chkInput.diskI++
+            $work@Drive: chkInput.diskI
+    }
+}
+
+
+// ───────────── Bookkeeping ─────────────
+// Remembers a bad sector: $base = sector number, $work = kind (0 read, 1 write, 2 data).
+prepare $base@Sector, $work@Kind
+private methode NoteBad(keep base, keep work, index){
+    // only the first LIST_MAX sectors are stored
+    $index@Slot: chkCount.listed
+    if ($index < LIST_MAX){
+        BadLba[$index]: $base
+        BadKind[$index]: $work
+        $index++
+        chkCount.listed: $index
+    }
+}
+
+// Progress line: state, percent, speed, error count. Back to the start of the line (carriage return).
+private methode Progress(base, work, keep counter, xmm6, item, admin){
+    prepare $base@Char: 13 call BasicBare.PutChar(=)
+
+    // which state is shown?
+    $base: chkPass.phase
+    if ($base = 1){
+        $pBase: "  writing   "
+    } else {
+        if ($base = 2){
+            $pBase: "  verifying "
+        } else {
+            $pBase: "  reading   "
+        }
+    }
+    prepare $base@Text call BasicBare.Print(=)
+
+    // percent = position * 100 / disk size (never more than 100)
+    $work@Position: chkPass.cur
+    if ($work > chkDisk.total){
+        $work: chkDisk.total
+    }
+    $work *: 100
+    $work /: chkDisk.total
+    prepare $base@Number: $work@Percent call BasicBare.PrintInt(=)
+    prepare " %  " call BasicBare.Print(=)
+
+    // speed: bytes per microsecond = MB/s, one decimal place
+    call Tsc()
+    $work: $counter@Now
+    $work -: chkPass.passStart
+    $work /: chkTime.mhz                  // microseconds
+    if ($work = 0){
+        $work: 1                          // avoid a division by zero
+    }
+
+    $base@Tested: chkPass.tested
+    @Tested <<: 9                         // sectors * 512 = bytes
+    @Tested *: 10                         // one extra decimal place
+    @Tested /: $work@Micros
+    $xmm6@SafeBase: $base
+
+    // whole part, point, decimal
+    $base /: 10
+    prepare $base call BasicBare.PrintInt(=)
+    prepare "." call BasicBare.Print(=)
+    $base: @SafeBase
+    $work: 10
+    $base %: $work@Divisor
+    prepare $base@Number call BasicBare.PrintInt(=)
+    prepare " MB/s  bad: " call BasicBare.Print(=)
+
+    // errors and slow blocks
+    $base: chkCount.readErr
+    $base +: chkCount.writeErr
+    $base +: chkCount.dataErr
+    prepare $base call BasicBare.PrintInt(=)
+    prepare "  slow: " call BasicBare.Print(=)
+    prepare chkCount.slow call BasicBare.PrintInt(=)
+    prepare "      " call BasicBare.Print(=)
+    prepare 13 call BasicBare.PutChar(=)
+}
+
+// The block of chkPass.chunkSecs sectors from chkPass.cur failed as a whole ($work = 0 read / 1 write): try every sector alone
+// (read: twice; write: from Buf, where the pattern lies). Counts errors and good sectors.
+prepare $work@Mode
+private methode Isolate(base, temp, work, index, counter, xmm9, item, admin){
+    $xmm9@Mode: $work                     // keep the mode over the calls
+    chkPass.sec: 0
+
+    // go through all sectors of the block
+    $work@Sec: 0
+    loop ($work < chkPass.chunkSecs){
+        // absolute number of this sector
+        $work: chkPass.cur
+        $work +: chkPass.sec
+        chkPass.lba: $work
+        chkPass.tries: 0
+
+        // up to two attempts per sector
+        $work@Tries: 0
+        loop ($work < 2){
+            $base@Sector: chkPass.lba
+            $work@Count: 1
+            $pTemp: Buf
+            $index: $xmm9@SafeIndex
+            
+            if ($index@Mode = 1){
+                // write: the pattern of this sector lies at Buf + sec * 512
+                $index: chkPass.sec
+                $index <<: 9
+                $pTemp +: $index
+                prepare $base@Sector, $temp@Source, $work@Count call Disk.Write(=)
+            } else {
+                // read into the start of Buf
+                prepare $base, $temp, $work@Count call Disk.Read(=)
+            }
+
+            // success ends the attempts at once
+            goto_flag carry SectorGood
+            chkCount.lastErr: $counter@BiosCode
+            chkPass.tries++
+            $work: chkPass.tries
+        }
+
+        // both attempts failed: this sector is bad
+        $index: @SafeIndex
+        if ($index@Mode = 1){
+            chkCount.writeErr++
+            prepare $base@Sector: chkPass.lba, $work: 1 call NoteBad(=)
+        } else {
+            chkCount.readErr++
+            prepare $base@Sector: chkPass.lba, $work: 0 call NoteBad(=)
+        }
+        goto NextSector
+
+        ->SectorGood
+            chkPass.tested++
+
+        ->NextSector
+            chkPass.sec++
+            $work@Sec: chkPass.sec
+    }
+}
+
+// Sets the counters for a new test back.
+private methode ResetCounts{
+    chkCount.readErr: 0
+    chkCount.writeErr: 0
+    chkCount.dataErr: 0
+    chkCount.slow: 0
+    chkCount.lastErr: 0
+    chkCount.listed: 0
+    chkCount.aborted: 0
+    chkPass.tailDone: 0
+}
+
+// Starts a pass: chkPass.cur = 0, chkPass.tested = 0, note the time, state for the display ($work).
+prepare $work@Phase
+private methode StartPass(keep work, keep counter){
+    chkPass.phase: $work
+    chkPass.cur: 0
+    chkPass.tested: 0
+    chkPass.blocks: 0
+    
+    call Tsc()
+    
+    chkPass.passStart: $counter@Start
+}
+
+// Finds chkPass.chunkSecs (at most CHUNK) for the block at chkPass.cur. Carry = 0: end of the disk reached.
+private methode NextChunk(work){
+    $work@Position: chkPass.cur
+    
+    if ($work >= chkDisk.total){
+        unset_carry
+    } else {
+        // sectors left, but never more than one block
+        $work: chkDisk.total
+        $work -: chkPass.cur
+        
+        if ($work > CHUNK){
+            $work: CHUNK
+        }
+        
+        chkPass.chunkSecs: $work@Sectors
+        set_carry
+    }
+}
+
+// Moves chkPass.cur on to the next block. $work = sectors to skip in addition.
+prepare $work@Skip
+private methode Advance(base, work){
+    $base@Position: chkPass.cur
+    $base +: chkPass.chunkSecs
+    $base +: $work
+    chkPass.cur: $base
+    chkPass.blocks++
+}
+
+// Shows the progress every PROG_EVERY blocks.
+private methode MaybeProgress(base, work, keep counter, xmm6, item, admin){
+    $base@Blocks: chkPass.blocks
+    $work: PROG_EVERY
+    $base %: $work
+    
+    if ($base = 0){
+        call Progress(=)
+    }
+}
+
+// Notes the time at the start of a block (chkTime.t0) ...
+private methode TimeStart(keep counter){
+    call Tsc()
+    chkTime.t0: $counter@Start
+}
+
+// ... and after the block checks whether it was slow (chkCount.slow).
+private methode TimeEnd(work, keep counter){
+    call Tsc()
+    $work@Used: $counter@Now
+    $work -: chkTime.t0
+    
+    if ($work > chkTime.slowLimit){
+        chkCount.slow++
+    }
+}
+
+
+// ───────────── The passes ─────────────
+// Read pass. chkDisk.mode 1 (quick test): only every 32nd block and the last; chkDisk.mode 2/3: everything. Carry = 0: stopped with Esc.
+private methode ReadPass(base, temp, work, index, counter, xmm6, xmm9, item, admin){
+    // after a write test the pass verifies (phase 2), otherwise it only reads (phase 0)
+    $work@Phase: 0
+    _: chkDisk.mode
+    if (_ = 3){
+        $work: 2
+    }
+    prepare $work@Phase call StartPass(=)
+
+    // one round per block until the disk end or Esc
+    chkPass.running: 1
+    $work@Running: 1
+    loop ($work != 0){
+        call NextChunk(=)
+        goto_flag carry HaveBlock
+
+        // end of the disk reached: the quick test reads the very end once more
+        chkPass.running: 0
+        $work: chkDisk.mode
+        if ($work = 1){
+            $work: chkPass.tailDone
+            
+            if ($work = 0){
+                $work: chkDisk.total
+                
+                if ($work > CHUNK){
+                    chkPass.tailDone: 1
+                    $work -: CHUNK
+                    chkPass.cur: $work
+                    chkPass.running: 1
+                }
+            }
+        }
+        goto RoundEnd
+
+        ->HaveBlock
+            call EscPressed(=)
+            goto_flag carry StopNow
+
+            // read the whole block with one BIOS call
+            call TimeStart(=)
+            prepare $base@Sector: chkPass.cur, $pTemp@Target: Buf, $work@Count: chkPass.chunkSecs call Disk.Read(=)
+            goto_flag not_carry ReadFailed
+            call TimeEnd(=)
+
+            $index@Phase: chkPass.phase
+            if ($index = 2){
+                // verify every sector against the pattern
+                chkPass.sec: 0
+                $work@Sec: 0
+                loop ($work < chkPass.chunkSecs){
+                    $base@Sector: chkPass.cur
+                    $base +: chkPass.sec
+                    $work: chkPass.sec
+                    call VerifySector()
+                    goto_flag not_carry WrongData
+                    chkPass.tested++
+                    goto VerifyNext
+
+                    ->WrongData
+                        chkCount.dataErr++
+                        $base: chkPass.cur
+                        $base +: chkPass.sec
+                        prepare $base, $work: 2 call NoteBad(=)
+
+                    ->VerifyNext
+                        chkPass.sec++
+                        $work@Sec: chkPass.sec
+                }
+            } else {
+                // plain read: the whole block is good
+                $work@Tested: chkPass.tested
+                $work +: chkPass.chunkSecs
+                chkPass.tested: $work
+            }
+            goto BlockDone
+
+        ->ReadFailed
+            // the whole block failed: find the bad sectors one by one
+            chkCount.lastErr: $counter@BiosCode
+            call TimeEnd(=)
+            prepare $work: 0 call Isolate(=)
+
+        ->BlockDone
+            // quick test: jump over the next 31 blocks
+            $work@Skip: 0
+            _: chkDisk.mode
+            
+            if (_ = 1){
+                $work: QUICK_SKIP
+            }
+            
+            prepare $work@Skip call Advance(=)
+            call MaybeProgress(=)
+            goto RoundEnd
+
+        ->StopNow
+            // Esc: stop the pass and note it
+            chkCount.aborted: 1
+            chkPass.running: 0
+
+        ->RoundEnd
+            $work@Running: chkPass.running
+    }
+
+    // result: finished (with a last progress line) or stopped with Esc
+    $work: chkCount.aborted
+    if ($work = 0){
+        call Progress(=)
+        set_carry
+    } else {
+        unset_carry
+    }
+}
+
+// Write pass (chkDisk.mode 3): the pattern into every sector. Carry = 0: stopped with Esc.
+private methode WritePass(base, temp, work, index, counter, xmm6, xmm9, item, admin){
+    prepare $work@Phase: 1 call StartPass(=)
+
+    // one round per block until the disk end or Esc
+    chkPass.running: 1
+    $work@Running: 1
+    loop ($work != 0){
+        call NextChunk(=)
+        goto_flag carry HaveBlock
+
+        // end of the disk reached
+        chkPass.running: 0
+        goto RoundEnd
+
+        ->HaveBlock
+            call EscPressed(=)
+            goto_flag carry StopNow
+
+            // build the pattern for this block, then write it with one BIOS call
+            $base@Sector: chkPass.cur
+            $work@Count: chkPass.chunkSecs
+            call Fill()
+            call TimeStart(=)
+            prepare $base: chkPass.cur, $pTemp@Source: Buf, $work: chkPass.chunkSecs call Disk.Write(=)
+            goto_flag not_carry WriteFailed
+            call TimeEnd(=)
+
+            // the whole block is written
+            $work@Tested: chkPass.tested
+            $work +: chkPass.chunkSecs
+            chkPass.tested: $work
+            goto BlockDone
+
+        ->WriteFailed
+            // the whole block failed: write the sectors one by one
+            chkCount.lastErr: $counter@BiosCode
+            call TimeEnd(=)
+            prepare $work: 1 call Isolate(=)
+
+        ->BlockDone
+            prepare $work@Skip: 0 call Advance(=)
+            call MaybeProgress(=)
+            goto RoundEnd
+
+        ->StopNow
+            // Esc: stop the pass and note it
+            chkCount.aborted: 1
+            chkPass.running: 0
+
+        ->RoundEnd
+            $work@Running: chkPass.running
+    }
+
+    // result: finished (with a last progress line) or stopped with Esc
+    $work: chkCount.aborted
+    if ($work = 0){
+        call Progress(=)
+        set_carry
+    } else {
+        unset_carry
+    }
+}
+
+
+// ───────────── Result ─────────────
+// Result and verdict.
+private methode Report(base, work, index, xmm6, item, admin){
+    // heading
+    prepare $base@Char: 10 call BasicBare.PutChar(=)
+    prepare $pBase: "Result for " call BasicBare.Print(=)
+    prepare $base: chkDisk.drive call PutDisk(=)
+    prepare $pBase: "\n" call BasicBare.Print(=)
+
+    $base: chkCount.aborted
+    if ($base != 0){
+        prepare $pBase: "  The test was stopped with Esc, the result is partial.\n" call BasicBare.Print(=)
+    }
+
+    // the counters
+    prepare $pBase@Text: "  Sectors without error : " call BasicBare.Print(=)
+    prepare $base: chkPass.tested call BasicBare.PrintInt(=)
+    prepare $pBase: "\n  Read errors           : " call BasicBare.Print(=)
+    prepare $base: chkCount.readErr call BasicBare.PrintInt(=)
+    prepare $pBase: "\n  Write errors          : " call BasicBare.Print(=)
+    prepare $base: chkCount.writeErr call BasicBare.PrintInt(=)
+    prepare $pBase: "\n  Data errors           : " call BasicBare.Print(=)
+    prepare $base: chkCount.dataErr call BasicBare.PrintInt(=)
+    prepare $pBase: "\n  Slow blocks (> 0.5 s) : " call BasicBare.Print(=)
+    prepare $base: chkCount.slow call BasicBare.PrintInt(=)
+    prepare $base: 10 call BasicBare.PutChar(=)
+
+    // the first bad sectors, each with a letter for its kind
+    $index@Listed: chkCount.listed
+    if ($index != 0){
+        prepare $pBase: "  First bad sectors     :" call BasicBare.Print(=)
+        chkPass.sec: 0
+        $work@Sec: 0
+        loop ($work < chkCount.listed){
+            prepare $base@Char: 32 call BasicBare.PutChar(=)
+            $index: chkPass.sec
+            prepare $base: BadLba[$index] call BasicBare.PrintInt(=)
+
+            // read errors get no letter, write errors "w", data errors "d"
+            _@Kind: BadKind[$index]
+            if (_ = 1){
+                prepare $base@Char: 'w' call BasicBare.PutChar(=)
+            } else {
+                if (_ = 2){
+                    prepare $base@Char: 'd' call BasicBare.PutChar(=)
+                }
+            }
+
+            chkPass.sec++
+            $work@Sec: chkPass.sec
+        }
+        prepare $pBase@Text: "\n  (d = wrong data, w = write error)\n" call BasicBare.Print(=)
+    }
+
+    // verdict: errors, or no errors (then complete or partial, slow or fast)
+    $base@Errors: chkCount.readErr
+    $base +: chkCount.writeErr
+    $base +: chkCount.dataErr
+    if ($base != 0){
+        prepare $pBase: "\nVERDICT: PROBLEMS FOUND. This disk has unreadable or unreliable sectors.\nCopy your data to another disk now and do not trust this one with new data.\n" call BasicBare.Print(=)
+        $base: chkCount.dataErr
+        if ($base != 0){
+            prepare $pBase: "Wrong data after writing also appears on fake USB sticks that claim more\ncapacity than they really have." call BasicBare.Print(=)
+        }
+    } else {
+        // no verdict for a test that was stopped
+        $base: chkCount.aborted
+        if ($base = 0){
+            prepare $pBase: "\nVERDICT: OK. No errors found.\n" call BasicBare.Print(=)
+            $base: chkCount.slow
+            if ($base != 0){
+                prepare $pBase: "But some blocks were slow: the disk may be getting weak, keep a backup." call BasicBare.Print(=)
+            } else {
+                $base: chkDisk.mode
+                if ($base = 3){
+                    prepare $pBase@Text: "Every sector kept what was written." call BasicBare.Print(=)
+                } else {
+                    prepare $pBase: "(A read test cannot find a fake capacity; the write test can.)" call BasicBare.Print(=)
+                }
+            }
+        }
+    }
+    prepare $base@Char: 10 call BasicBare.PutChar(=)
+}
+
+
+// ───────────── Main program ─────────────
+Start{
+    // keyboard, boot drive and title line
+    call Keyboard.Init(=)
+    call Disk.BootDrive(=)
+    chkDisk.bootDrive: $counter@BootDrive
+    call BasicBare.Clear(=)
+    prepare $work@Attribute: 0x0B call BasicBare.SetColor(=)
+    prepare $pBase@Text: "diskcheck - find bad sectors and broken disks\n" call BasicBare.Print(=)
+    prepare $work: 7 call BasicBare.SetColor(=)
+
+    // measure the CPU speed; fall back to 1000 MHz when it cannot be measured
+    call TscMhz()
+    chkTime.mhz: $counter
+    if ($counter = 0){
+        chkTime.mhz: 1000
+    }
+
+    // a block is slow when it takes longer than SLOW_MS: milliseconds * 1000 * MHz = ticks
+    $work@Ticks: chkTime.mhz
+    $work *: SLOW_MS
+    $work *: 1000
+    chkTime.slowLimit: $work
+
+    // the drive menu: one round per chosen drive, until Enter without a number
+    chkInput.menuRun: 1
+    $work@Running: 1
+    loop ($work != 0){
+        prepare $base@Char: 10 call BasicBare.PutChar(=)
+        call ListDisks(=)
+        prepare $pBase: "\nDisk number (Enter = quit): " call BasicBare.Print(=)
+        call ReadNumber(=)
+
+        // Enter without a number: leave the program
+        $base: chkInput.numLen
+        if ($base = 0){
+            chkInput.menuRun: 0
+            goto MenuNext
+        }
+
+        // is it a drive the BIOS knows?
+        $base@Number: chkInput.numVal
+        if ($base > 15){
+            goto NoDisk
+        }
+        $base +: 128
+        chkDisk.drive: $base
+        prepare $base call Disk.Info(=)
+        goto_flag not_carry NoDisk
+        chkDisk.total: $counter@Sectors
+
+        // only drives with 512-byte sectors
+        $work: $value@SectorSize
+        if ($work@SectorSize != 512){
+            goto BadSec
+        }
+
+        // show the chosen drive and offer the three tests
+        prepare $pBase: "Selected: " call BasicBare.Print(=)
+        prepare $base: chkDisk.drive call PutDisk(=)
+        prepare $pBase: ", " call BasicBare.Print(=)
+        $base: chkDisk.total
+        $base >>: 11
+        prepare $base call BasicBare.PrintInt(=)
+        prepare $pBase: " MiB\n\nTest:\n  1  Quick read test   about 3 % of the disk (every 32nd block and the end); safe\n" call BasicBare.Print(=)
+        prepare $pBase: "  2  Full read test    reads every sector; safe, no data is changed\n" call BasicBare.Print(=)
+        prepare $pBase: "  3  Write test        writes and verifies every sector; DESTROYS ALL DATA\n                       (also finds fake capacity)\n" call BasicBare.Print(=)
+        prepare $pBase: "Choice (Enter = back): " call BasicBare.Print(=)
+        call ReadNumber(=)
+
+        // Enter without a number, or a number outside 1..3: back to the drive list
+        $base: chkInput.numLen
+        if ($base = 0){
+            goto MenuNext
+        }
+        $base@Choice: chkInput.numVal
+        if ($base < 1 or $base > 3){
+            goto MenuNext
+        }
+        chkDisk.mode: $base
+
+        // write test: never on the boot drive, and only after the word YES
+        if ($base = 3){
+            $work: chkDisk.drive
+            if ($work = chkDisk.bootDrive){
+                goto IsBoot
+            }
+            prepare $pBase: "The write test DESTROYS ALL DATA on " call BasicBare.Print(=)
+            prepare $base: chkDisk.drive call PutDisk(=)
+            prepare $pBase: ". Type YES (capital letters) to continue: " call BasicBare.Print(=)
+            call ReadYes(=)
+            goto_flag not_carry Cancelled
+        }
+
+        // run the test
+        call ResetCounts()
+        prepare $base@Drive: chkDisk.drive call Disk.SetDrive(=)
+        prepare $pBase: "Testing, press Esc to stop.\n" call BasicBare.Print(=)
+        $base: chkDisk.mode
+        if ($base = 3){
+            // write test: write everything, then read it back and verify (unless Esc stopped the writing)
+            call WritePass(=)
+            goto_flag not_carry Finished
+            call ReadPass(=)
+        } else {
+            // quick or full read test
+            call ReadPass(=)
+        }
+
+        // back to the boot drive and show the result
+        ->Finished
+            call BootSet(=)
+            call Report(=)
+            goto MenuNext
+
+        // ---- messages for input that cannot be used ----
+        ->NoDisk
+            prepare $pBase@Text: "No such disk.\n" call BasicBare.Print(=)
+            goto MenuNext
+
+        ->BadSec
+            prepare $pBase@Text: "Only disks with 512-byte sectors are supported.\n" call BasicBare.Print(=)
+            goto MenuNext
+
+        ->IsBoot
+            prepare $pBase@Text: "That is the disk IbytBMS runs from; the write test would destroy it. Choose another disk or test 1 or 2.\n" call BasicBare.Print(=)
+            goto MenuNext
+
+        ->Cancelled
+            prepare $pBase@Text: "Cancelled. Nothing was written.\n" call BasicBare.Print(=)
+
+        ->MenuNext
+            $work@Running: chkInput.menuRun
+    }
+
+    // quit: make the boot drive the default again
+    call BootSet(=)
+    exit
+}
+
+// Makes the boot drive the default drive again.
+private methode BootSet(base, counter){
+    call Disk.BootDrive(=)
+    prepare $base@Drive: $counter@BootDrive call Disk.SetDrive(=)
+}
